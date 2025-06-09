@@ -11,14 +11,22 @@ import copy
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+import typing
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import colorama
 
+from sky import exceptions
 from sky import sky_logging
 from sky.adaptors import aws
 from sky.provision import common
 from sky.provision.aws import utils
+from sky.utils import annotations
+from sky.utils import common_utils
+
+if typing.TYPE_CHECKING:
+    import mypy_boto3_ec2
+    from mypy_boto3_ec2 import type_defs as ec2_type_defs
 
 logger = sky_logging.init_logger(__name__)
 
@@ -39,8 +47,9 @@ def _skypilot_log_error_and_exit_for_failover(error: str) -> None:
     Mainly used for handling VPC/subnet errors before nodes are launched.
     """
     # NOTE: keep. The backend looks for this to know no nodes are launched.
-    prefix = 'SKYPILOT_ERROR_NO_NODES_LAUNCHED: '
-    raise RuntimeError(prefix + error)
+    full_error = f'SKYPILOT_ERROR_NO_NODES_LAUNCHED: {error}'
+    logger.error(full_error)
+    raise RuntimeError(full_error)
 
 
 def bootstrap_instances(
@@ -91,9 +100,9 @@ def bootstrap_instances(
         extended_ip_rules = security_group_config.get('IpPermissions', [])
         if extended_ip_rules is None:
             extended_ip_rules = []
-        security_group_ids = _configure_security_group(
-            ec2, vpc_id, expected_sg_name,
-            config.provider_config.get('ports', []), extended_ip_rules)
+        security_group_ids = _configure_security_group(ec2, vpc_id,
+                                                       expected_sg_name,
+                                                       extended_ip_rules)
         end_time = time.time()
         elapsed = end_time - start_time
         logger.info(
@@ -190,12 +199,107 @@ def _configure_iam_role(iam) -> Dict[str, Any]:
             for policy_arn in attach_policy_arns:
                 role.attach_policy(PolicyArn=policy_arn)
 
+            # SkyPilot: 'PassRole' is required by the controllers (jobs and
+            # services) created with `aws.remote_identity: SERVICE_ACCOUNT` to
+            # create instances with the IAM role.
+            skypilot_pass_role_policy_doc = {
+                'Statement': [
+                    {
+                        'Effect': 'Allow',
+                        'Action': [
+                            'iam:GetRole',
+                            'iam:PassRole',
+                        ],
+                        'Resource': role.arn,
+                    },
+                    {
+                        'Effect': 'Allow',
+                        'Action': 'iam:GetInstanceProfile',
+                        'Resource': profile.arn,
+                    },
+                ]
+            }
+            role.Policy('SkyPilotPassRolePolicy').put(
+                PolicyDocument=json.dumps(skypilot_pass_role_policy_doc))
+
         profile.add_role(RoleName=role.name)
         time.sleep(15)  # wait for propagation
     return {'Arn': profile.arn}
 
 
+@annotations.lru_cache(scope='request', maxsize=128)  # Keep bounded.
+def _get_route_tables(ec2: 'mypy_boto3_ec2.ServiceResource',
+                      vpc_id: Optional[str], region: str,
+                      main: bool) -> List[Any]:
+    """Get route tables associated with a VPC and region
+
+    Args:
+        ec2: ec2 resource object
+        vpc_id: vpc_id is optional, if not provided, all route tables in the
+                region will be returned
+        region: region is mandatory to allow the lru cache
+                   to return the corect results
+        main: if True, only main route tables will be returned otherwise
+                only non-main route tables will be returned
+
+    Returns:
+        A list of route tables associated with the options VPC and region
+    """
+    filters = [{'Name': 'association.main', 'Values': [str(main).lower()]}]
+    if vpc_id is not None:
+        filters.append({'Name': 'vpc-id', 'Values': [vpc_id]})
+    logger.debug(
+        f'Getting route tables with filters: {filters} in region: {region}')
+    return ec2.meta.client.describe_route_tables(Filters=filters).get(
+        'RouteTables', [])
+
+
+def _is_subnet_public(ec2: 'mypy_boto3_ec2.ServiceResource', subnet_id,
+                      vpc_id: Optional[str]) -> bool:
+    """Checks if a subnet is public by existence of a route to an IGW.
+
+    Conventionally, public subnets connect to a IGW, and private subnets to a
+    NAT. See ref:
+    https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Internet_Gateway.html
+    """
+    # Get the route tables associated with the subnet
+    region = ec2.meta.client.meta.region_name
+    all_route_tables = _get_route_tables(ec2, vpc_id, region, main=False)
+    route_tables = [
+        rt for rt in all_route_tables
+        # An RT can be associated with multiple subnets, i.e.,
+        # rt['Associations'] is a list of associations.
+        # There may be no subnet associated in an association.
+        if any(
+            assoc.get('SubnetId', '') == subnet_id
+            for assoc in rt['Associations'])
+    ]
+
+    # Check each route table for an internet gateway route
+    def _has_igw_route(route_tables):
+        for route_table in route_tables:
+            for route in route_table.get('Routes', []):
+                if route.get('GatewayId', '').startswith('igw-'):
+                    return True
+        return False
+
+    logger.debug(f'subnet {subnet_id} route tables: {route_tables}')
+    if _has_igw_route(route_tables):
+        return True
+    if route_tables:
+        return False
+
+    # Handle the case that a "main" route table is implicitly associated with
+    # subnets. Since the associations are implicit, the filter above won't find
+    # any. Check there exists a main route table with routes pointing to an IGW.
+    logger.debug('Checking main route table')
+    region = ec2.meta.client.meta.region_name
+    main_route_tables = _get_route_tables(ec2, vpc_id, region, main=True)
+    return _has_igw_route(main_route_tables)
+
+
 def _usable_subnets(
+    ec2,
     user_specified_subnets: Optional[List[Any]],
     all_subnets: List[Any],
     azs: Optional[str],
@@ -215,6 +319,14 @@ def _usable_subnets(
         str: VPC ID of the first subnet.
     """
 
+    # For existing cluster, it is ok to return a VPC and subnet not used by
+    # the cluster, as AWS will ignore them.
+    # There is a corner case where the multi-node cluster was partially
+    # launched, launching the cluster again can cause the nodes located on
+    # different VPCs, if VPCs in the project have changed. It should be fine to
+    # not handle this special case as we don't want to sacrifice the performance
+    # for every launch just for this rare case.
+
     def _are_user_subnets_pruned(current_subnets: List[Any]) -> bool:
         return user_specified_subnets is not None and len(
             current_subnets) != len(user_specified_subnets)
@@ -226,14 +338,6 @@ def _usable_subnets(
         }
         return user_specified_subnet_ids - current_subnet_ids
 
-    def _subnet_name_tag_contains(subnet, substr: str) -> bool:
-        tags = subnet.meta.data['Tags']
-        for tag in tags:
-            if tag['Key'] == 'Name':
-                name = tag['Value']
-                return substr in name
-        return False
-
     try:
         candidate_subnets = (user_specified_subnets if user_specified_subnets
                              is not None else all_subnets)
@@ -242,60 +346,57 @@ def _usable_subnets(
                 s for s in candidate_subnets if s.vpc_id == vpc_id_of_sg
             ]
 
+        available_subnets = [
+            s for s in candidate_subnets if s.state == 'available'
+        ]
+
+        if use_internal_ips:
+            # Get private subnets.
+            #
+            # We get private subnets by (1) not _is_subnet_public(), which
+            # checks if there is a route to IGW; (2) the subnets must not assign
+            # public IPs by default (not map_public_ip_on_launch).
+            subnets = [
+                s for s in available_subnets
+                if not _is_subnet_public(ec2, s.subnet_id, vpc_id_of_sg) and
+                not s.map_public_ip_on_launch
+            ]
+        else:
+            # Get public subnets.
+            #
+            # Note that we do not test for 's.map_public_ip_on_launch' being
+            # True. For example, the VPC creation helper from AWS will create a
+            # 'public' and a 'private' subnet per AZ. However, the created
+            # 'public' subnet by default has map_public_ip_on_launch set to
+            # False as well. We can still allow users to launch a public
+            # IP-enabled VM in such a public subnet (the underlying
+            # ec2.create_instances() call will set AssociatePublicIpAddress to
+            # True appropriately).
+            subnets = [
+                s for s in available_subnets
+                if _is_subnet_public(ec2, s.subnet_id, vpc_id_of_sg)
+            ]
+
         subnets = sorted(
-            (
-                s for s in candidate_subnets if s.state == 'available' and (
-                    # If using internal IPs, the subnets must not assign public
-                    # IPs. Additionally, requires that each eligible subnet
-                    # contain a name tag which includes the substring
-                    # 'private'. This is a HACK; see below.
-                    #
-                    # Reason: the first two checks alone are not enough. For
-                    # example, the VPC creation helper from AWS will create a
-                    # 'public' and a 'private' subnet per AZ. However, the
-                    # created 'public' subnet by default has
-                    # map_public_ip_on_launch set to False as well. This means
-                    # we could've launched in that subnet, which will make any
-                    # instances not able to send outbound traffic to the
-                    # Internet, due to the way route tables/gateways are set up
-                    # for that public subnet. The 'public' subnets are NOT
-                    # intended to host data plane VMs, while the 'private'
-                    # subnets are.
-                    #
-                    # An alternative to the subnet name hack is to ensure
-                    # there's a route (dest=0.0.0.0/0, target=nat-*) in the
-                    # subnet's route table so that outbound connections
-                    # work. This seems hard to do, given a ec2.Subnet
-                    # object. (Easy to see in console though.) So we opt for
-                    # the subnet name requirement for now.
-                    (use_internal_ips and not s.map_public_ip_on_launch and
-                     _subnet_name_tag_contains(s, 'private')) or
-                    # Or if using public IPs, the subnets must assign public
-                    # IPs.
-                    (not use_internal_ips and s.map_public_ip_on_launch)
-                    # NOTE: SkyPilot also changes the semantics of
-                    # 'use_internal_ips' through the above two conditions.
-                    # Previously, this flag by itself does not enforce only
-                    # choosing subnets that do not assign public IPs.  Now we
-                    # do so.
-                    #
-                    # In both before and now, this flag makes Ray communicate
-                    # between the client and the head node using the latter's
-                    # private ip.
-                )),
+            subnets,
             reverse=True,  # sort from Z-A
             key=lambda subnet: subnet.availability_zone,
         )
+        logger.debug(f'use_internal_ips: {use_internal_ips}')
+        logger.debug(f'subnets: {subnets}')
     except aws.botocore_exceptions().ClientError as exc:
         utils.handle_boto_error(exc,
                                 'Failed to fetch available subnets from AWS.')
         raise exc
 
     if not subnets:
+        vpc_msg = (f'Does a default VPC exist in region '
+                   f'{ec2.meta.client.meta.region_name}? ') if (
+                       vpc_id_of_sg is None) else ''
         _skypilot_log_error_and_exit_for_failover(
-            'No usable subnets found, try '
-            'manually creating an instance in your specified region to '
-            'populate the list of subnets and trying this again. '
+            f'No usable subnets found. {vpc_msg}'
+            'Try manually creating an instance in your specified region to '
+            'populate the list of subnets and try again. '
             'Note that the subnet must map public IPs '
             'on instance launch unless you set `use_internal_ips: true` in '
             'the `provider` config.')
@@ -347,10 +448,14 @@ def _usable_subnets(
     return subnets, first_subnet_vpc_id
 
 
-def _vpc_id_from_security_group_ids(ec2, sg_ids: List[str]) -> Any:
+def _vpc_id_from_security_group_ids(ec2: 'mypy_boto3_ec2.ServiceResource',
+                                    sg_ids: List[str]) -> Any:
     # sort security group IDs to support deterministic unit test stubbing
     sg_ids = sorted(set(sg_ids))
-    filters = [{'Name': 'group-id', 'Values': sg_ids}]
+    filters: List['ec2_type_defs.FilterTypeDef'] = [{
+        'Name': 'group-id',
+        'Values': sg_ids
+    }]
     security_groups = ec2.security_groups.filter(Filters=filters)
     vpc_ids = [sg.vpc_id for sg in security_groups]
     vpc_ids = list(set(vpc_ids))
@@ -363,12 +468,13 @@ def _vpc_id_from_security_group_ids(ec2, sg_ids: List[str]) -> Any:
 
     no_sg_msg = ('Failed to detect a security group with id equal to any of '
                  'the configured SecurityGroupIds.')
-    assert len(vpc_ids) > 0, no_sg_msg
+    assert vpc_ids, no_sg_msg
 
     return vpc_ids[0]
 
 
-def _get_vpc_id_by_name(ec2, vpc_name: str, region: str) -> str:
+def _get_vpc_id_by_name(ec2: 'mypy_boto3_ec2.ServiceResource', vpc_name: str,
+                        region: str) -> str:
     """Returns the VPC ID of the unique VPC with a given name.
 
     Exits with code 1 if:
@@ -376,7 +482,10 @@ def _get_vpc_id_by_name(ec2, vpc_name: str, region: str) -> str:
       - More than 1 VPC with the given name are found in the current region.
     """
     # Look in the 'Name' tag (shown as Name column in console).
-    filters = [{'Name': 'tag:Name', 'Values': [vpc_name]}]
+    filters: List['ec2_type_defs.FilterTypeDef'] = [{
+        'Name': 'tag:Name',
+        'Values': [vpc_name]
+    }]
     vpcs = list(ec2.vpcs.filter(Filters=filters))
     if not vpcs:
         _skypilot_log_error_and_exit_for_failover(
@@ -392,8 +501,9 @@ def _get_vpc_id_by_name(ec2, vpc_name: str, region: str) -> str:
     return vpcs[0].id
 
 
-def _get_subnet_and_vpc_id(ec2, security_group_ids: Optional[List[str]],
-                           region: str, availability_zone: Optional[str],
+def _get_subnet_and_vpc_id(ec2: 'mypy_boto3_ec2.ServiceResource',
+                           security_group_ids: Optional[List[str]], region: str,
+                           availability_zone: Optional[str],
                            use_internal_ips: bool,
                            vpc_name: Optional[str]) -> Tuple[Any, str]:
     if vpc_name is not None:
@@ -404,9 +514,15 @@ def _get_subnet_and_vpc_id(ec2, security_group_ids: Optional[List[str]],
         vpc_id_of_sg = None
 
     all_subnets = list(ec2.subnets.all())
+    # If no VPC is specified, use the default VPC.
+    # We filter only for default VPCs to avoid using subnets that users may
+    # not want SkyPilot to use.
+    if vpc_id_of_sg is None:
+        all_subnets = [s for s in all_subnets if s.vpc.is_default]
     subnets, vpc_id = _usable_subnets(
-        None,
-        all_subnets,
+        ec2,
+        user_specified_subnets=None,
+        all_subnets=all_subnets,
         azs=availability_zone,
         vpc_id_of_sg=vpc_id_of_sg,
         use_internal_ips=use_internal_ips,
@@ -414,35 +530,14 @@ def _get_subnet_and_vpc_id(ec2, security_group_ids: Optional[List[str]],
     return subnets, vpc_id
 
 
-def _retrieve_user_specified_rules(ports):
-    rules = []
-    for port in ports:
-        if isinstance(port, int):
-            from_port = to_port = port
-        else:
-            from_port, to_port = port.split('-')
-            from_port = int(from_port)
-            to_port = int(to_port)
-        rules.append({
-            'FromPort': from_port,
-            'ToPort': to_port,
-            'IpProtocol': 'tcp',
-            'IpRanges': [{
-                'CidrIp': '0.0.0.0/0'
-            }],
-        })
-    return rules
-
-
-def _configure_security_group(ec2, vpc_id: str, expected_sg_name: str,
-                              ports: List[Union[int, str]],
+def _configure_security_group(ec2: 'mypy_boto3_ec2.ServiceResource',
+                              vpc_id: str, expected_sg_name: str,
                               extended_ip_rules: List) -> List[str]:
     security_group = _get_or_create_vpc_security_group(ec2, vpc_id,
                                                        expected_sg_name)
     sg_ids = [security_group.id]
 
-    inbound_rules = _retrieve_user_specified_rules(ports)
-    inbound_rules.extend([
+    inbound_rules = [
         # intra-cluster rules
         {
             'FromPort': -1,
@@ -462,7 +557,7 @@ def _configure_security_group(ec2, vpc_id: str, expected_sg_name: str,
             }],
         },
         *extended_ip_rules,
-    ])
+    ]
     # upsert the default security group
     if not security_group.ip_permissions:
         # If users specify security groups, we should not change the rules
@@ -473,49 +568,80 @@ def _configure_security_group(ec2, vpc_id: str, expected_sg_name: str,
     return sg_ids
 
 
-def _get_or_create_vpc_security_group(ec2, vpc_id: str,
+def _get_or_create_vpc_security_group(ec2: 'mypy_boto3_ec2.ServiceResource',
+                                      vpc_id: str,
                                       expected_sg_name: str) -> Any:
+    """Find or create a security group in the specified VPC.
+
+    Args:
+        ec2: The initialized EC2 client object.
+        vpc_id: The ID of the VPC where the security group should be queried
+            or created.
+        expected_sg_name: The expected name of the security group.
+
+    Returns:
+        The security group object containing the details of the security group.
+
+    Raises:
+        exceptions.NoClusterLaunchedError: If the security group creation fails
+            and is not due to an existing duplicate.
+        botocore.exceptions.ClientError: If the security group creation fails
+            due to AWS service issues.
+    """
     # Figure out which security groups with this name exist for each VPC...
-    vpc_to_existing_sg = {
-        sg.vpc_id: sg for sg in _get_security_groups_from_vpc_ids(
-            ec2,
-            [vpc_id],
-            [expected_sg_name],
+    security_group = _get_security_group_from_vpc_id(ec2, vpc_id,
+                                                     expected_sg_name)
+    if security_group is not None:
+        return security_group
+
+    try:
+        # create a new security group
+        ec2.meta.client.create_security_group(
+            Description='Auto-created security group for Ray workers',
+            GroupName=expected_sg_name,
+            VpcId=vpc_id,
         )
-    }
+    except ec2.meta.client.exceptions.ClientError as e:
+        if e.response['Error']['Code'] == 'InvalidGroup.Duplicate':
+            # The security group already exists, but we didn't see it
+            # because of eventual consistency.
+            logger.warning(f'{expected_sg_name} already exists when creating.')
+            security_group = _get_security_group_from_vpc_id(
+                ec2, vpc_id, expected_sg_name)
+            assert (security_group is not None and
+                    security_group.group_name == expected_sg_name), (
+                        f'Expected {expected_sg_name} but got {security_group}')
+            logger.info(
+                f'Found existing security group {colorama.Style.BRIGHT}'
+                f'{security_group.group_name}{colorama.Style.RESET_ALL} '
+                f'[id={security_group.id}]')
+            return security_group
+        message = ('Failed to create security group. Error: '
+                   f'{common_utils.format_exception(e)}')
+        logger.warning(message)
+        raise exceptions.NoClusterLaunchedError(message) from e
 
-    if vpc_id in vpc_to_existing_sg:
-        return vpc_to_existing_sg[vpc_id]
-
-    # create a new security group
-    ec2.meta.client.create_security_group(
-        Description='Auto-created security group for Ray workers',
-        GroupName=expected_sg_name,
-        VpcId=vpc_id,
-    )
-    security_group = _get_security_groups_from_vpc_ids(ec2, [vpc_id],
-                                                       [expected_sg_name])
-
-    assert security_group, 'Failed to create security group'
-    security_group = security_group[0]
-
+    security_group = _get_security_group_from_vpc_id(ec2, vpc_id,
+                                                     expected_sg_name)
+    assert security_group is not None, 'Failed to create security group'
     logger.info(f'Created new security group {colorama.Style.BRIGHT}'
                 f'{security_group.group_name}{colorama.Style.RESET_ALL} '
                 f'[id={security_group.id}]')
     return security_group
 
 
-def _get_security_groups_from_vpc_ids(ec2, vpc_ids: List[str],
-                                      group_names: List[str]) -> List[Any]:
-    unique_vpc_ids = list(set(vpc_ids))
-    unique_group_names = set(group_names)
-
+def _get_security_group_from_vpc_id(ec2: 'mypy_boto3_ec2.ServiceResource',
+                                    vpc_id: str,
+                                    group_name: str) -> Optional[Any]:
+    """Get security group by VPC ID and group name."""
     existing_groups = list(
         ec2.security_groups.filter(Filters=[{
             'Name': 'vpc-id',
-            'Values': unique_vpc_ids
+            'Values': [vpc_id]
         }]))
-    filtered_groups = [
-        sg for sg in existing_groups if sg.group_name in unique_group_names
-    ]
-    return filtered_groups
+
+    for sg in existing_groups:
+        if sg.group_name == group_name:
+            return sg
+
+    return None

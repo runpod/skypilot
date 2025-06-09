@@ -1,32 +1,19 @@
 """GCP cloud adaptors"""
 
 # pylint: disable=import-outside-toplevel
-import functools
+import json
 
-googleapiclient = None
-google = None
+from sky.adaptors import common
 
-
-def import_package(func):
-
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        global googleapiclient, google
-        if googleapiclient is None or google is None:
-            try:
-                import google as _google
-                import googleapiclient as _googleapiclient
-                googleapiclient = _googleapiclient
-                google = _google
-            except ImportError:
-                raise ImportError('Failed to import dependencies for GCP. '
-                                  'Try: pip install "skypilot[gcp]"') from None
-        return func(*args, **kwargs)
-
-    return wrapper
+_IMPORT_ERROR_MESSAGE = ('Failed to import dependencies for GCP. '
+                         'Try pip install "skypilot[gcp]"')
+googleapiclient = common.LazyImport('googleapiclient',
+                                    import_error_message=_IMPORT_ERROR_MESSAGE)
+google = common.LazyImport('google', import_error_message=_IMPORT_ERROR_MESSAGE)
+_LAZY_MODULES = (google, googleapiclient)
 
 
-@import_package
+@common.load_lazy_modules(_LAZY_MODULES)
 def build(service_name: str, version: str, *args, **kwargs):
     """Build a GCP service.
 
@@ -34,51 +21,84 @@ def build(service_name: str, version: str, *args, **kwargs):
         service_name: GCP service name (e.g., 'compute', 'storagetransfer').
         version: Service version (e.g., 'v1').
     """
-    from googleapiclient import discovery
-    return discovery.build(service_name, version, *args, **kwargs)
+
+    return googleapiclient.discovery.build(service_name, version, *args,
+                                           **kwargs)
 
 
-@import_package
+@common.load_lazy_modules(_LAZY_MODULES)
 def storage_client():
-    """Helper method that connects to GCS Storage Client for
-    GCS Bucket
-    """
+    """Helper that connects to GCS Storage Client for GCS Bucket"""
     from google.cloud import storage
     return storage.Client()
 
 
-@import_package
+@common.load_lazy_modules(_LAZY_MODULES)
 def anonymous_storage_client():
-    """Helper method that connects to GCS Storage Client for
-    Public GCS Buckets
-    """
+    """Helper that connects to GCS Storage Client for Public GCS Buckets"""
     from google.cloud import storage
     return storage.Client.create_anonymous_client()
 
 
-@import_package
+@common.load_lazy_modules(_LAZY_MODULES)
 def not_found_exception():
     """NotFound exception."""
     from google.api_core import exceptions as gcs_exceptions
     return gcs_exceptions.NotFound
 
 
-@import_package
+@common.load_lazy_modules(_LAZY_MODULES)
 def forbidden_exception():
     """Forbidden exception."""
     from google.api_core import exceptions as gcs_exceptions
     return gcs_exceptions.Forbidden
 
 
-@import_package
+@common.load_lazy_modules(_LAZY_MODULES)
 def http_error_exception():
     """HttpError exception."""
     from googleapiclient import errors
     return errors.HttpError
 
 
-@import_package
+@common.load_lazy_modules(_LAZY_MODULES)
 def credential_error_exception():
     """CredentialError exception."""
     from google.auth import exceptions
     return exceptions.DefaultCredentialsError
+
+
+@common.load_lazy_modules(_LAZY_MODULES)
+def auth_error_exception():
+    """GoogleAuthError exception."""
+    from google.auth import exceptions
+    return exceptions.GoogleAuthError
+
+
+@common.load_lazy_modules(_LAZY_MODULES)
+def gcp_auth_refresh_error_exception():
+    """GCP auth refresh error exception."""
+    from google.auth import exceptions
+    return exceptions.RefreshError
+
+
+@common.load_lazy_modules(_LAZY_MODULES)
+def get_credentials(cred_type: str, credentials_field: str):
+    """Get GCP credentials."""
+    from google.oauth2 import service_account
+    from google.oauth2.credentials import Credentials as OAuthCredentials
+
+    if cred_type == 'service_account':
+        # If parsing the gcp_credentials failed, then the user likely made a
+        # mistake in copying the credentials into the config yaml.
+        try:
+            service_account_info = json.loads(credentials_field)
+        except json.decoder.JSONDecodeError as e:
+            raise RuntimeError('gcp_credentials found in cluster yaml file but '
+                               'formatted improperly.') from e
+        credentials = service_account.Credentials.from_service_account_info(
+            service_account_info)
+    elif cred_type == 'credentials_token':
+        # Otherwise the credentials type must be credentials_token.
+        credentials = OAuthCredentials(credentials_field)
+    return credentials

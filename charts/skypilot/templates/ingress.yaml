@@ -1,0 +1,61 @@
+{{- if .Values.ingress.enabled }}
+{{- $kubeVersion := .Capabilities.KubeVersion.Major -}}
+{{- $kubeMinorVersion := .Capabilities.KubeVersion.Minor | trimSuffix "+" | int -}}
+{{- $useNewIngressClass := or (gt ($kubeVersion | int) 1) (and (eq ($kubeVersion | int) 1) (ge $kubeMinorVersion 18)) -}}
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}-ingress
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    {{- if not $useNewIngressClass }}
+    kubernetes.io/ingress.class: nginx
+    {{- end }}
+    {{- if index .Values.ingress "oauth2-proxy" "enabled" }}
+    # OAuth2 Proxy authentication
+    nginx.ingress.kubernetes.io/auth-signin: {{ if index .Values.ingress "oauth2-proxy" "use-https" | default false }}https{{ else }}http{{ end }}://$host/oauth2/start?rd=$escaped_request_uri
+    nginx.ingress.kubernetes.io/auth-url: {{ if index .Values.ingress "oauth2-proxy" "use-https" | default false }}https{{ else }}http{{ end }}://$host/oauth2/auth
+    nginx.ingress.kubernetes.io/auth-response-headers: X-Auth-Request-Email
+    {{- else }}
+    # Basic authentication
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: {{ .Values.ingress.authSecret | default (printf "%s-basic-auth" .Release.Name) }}
+    {{- end }}
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1000m"
+    {{- if ne .Values.ingress.path "/" }}
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    skypilot.co/ingress-path: {{ .Values.ingress.path }}
+    {{- end }}
+    nginx.ingress.kubernetes.io/server-snippets: |
+      location / {
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Host $host;
+        proxy_set_header Connection "upgrade";
+        proxy_cache_bypass $http_upgrade;
+      }
+
+
+spec:
+  {{- if $useNewIngressClass }}
+  ingressClassName: nginx
+  {{- end }}
+  rules:
+  - host: {{ .Values.ingress.host }}
+    http:
+      paths:
+      {{- /* TODO(aylei): check whether this works for ingress-controllers other than nginx */}}
+      - pathType: {{ if eq .Values.ingress.path "/" }}Prefix{{ else }}ImplementationSpecific{{ end }}
+        path: {{ .Values.ingress.path }}{{ if ne .Values.ingress.path "/" }}(/|$)(.*){{ end }}
+        backend:
+          service:
+            name: {{ .Release.Name }}-api-service
+            port:
+              number: 80
+{{- end }}

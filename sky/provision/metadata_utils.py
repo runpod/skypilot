@@ -4,6 +4,7 @@ import contextlib
 import functools
 import pathlib
 import shutil
+from typing import Optional
 
 from sky import sky_logging
 
@@ -30,7 +31,7 @@ def _get_instance_metadata_dir(cluster_name: str,
 
 
 def cache_func(cluster_name: str, instance_id: str, stage_name: str,
-               hash_str: str):
+               hash_str: Optional[str]):
     """A helper function for caching function execution."""
 
     def decorator(function):
@@ -51,11 +52,14 @@ def cache_func(cluster_name: str, instance_id: str, stage_name: str,
 
 @contextlib.contextmanager
 def check_cache_hash_or_update(cluster_name: str, instance_id: str,
-                               stage_name: str, hash_str: str):
+                               stage_name: str, hash_str: Optional[str]):
     """A decorator for 'cache_func'."""
+    if hash_str is None:
+        yield True
+        return
     path = get_instance_cache_dir(cluster_name, instance_id) / stage_name
     if path.exists():
-        with open(path) as f:
+        with open(path, 'r', encoding='utf-8') as f:
             need_update = f.read() != hash_str
     else:
         need_update = True
@@ -69,7 +73,7 @@ def check_cache_hash_or_update(cluster_name: str, instance_id: str,
         raise e
     finally:
         if not errored and (not path.exists() or need_update):
-            with open(path, 'w') as f:
+            with open(path, 'w', encoding='utf-8') as f:
                 f.write(hash_str)
 
 

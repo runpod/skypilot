@@ -1,0 +1,62 @@
+name: Build and Publish Helm Charts
+description: Build and publish docker image and Helm charts for SkyPilot.
+
+on:
+  workflow_call:
+    inputs:
+      package_name:
+        description: 'SkyPilot PyPI package name'
+        required: true
+        type: string
+    secrets:
+      DOCKER_USERNAME:
+        required: true
+      DOCKER_PASSWORD:
+        required: true
+      HELM_DEPLOY_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'SkyPilot PyPI package name'
+        required: true
+        type: choice
+        options:
+          - 'skypilot-nightly'
+          - 'skypilot'
+        default: 'skypilot-nightly'
+
+jobs:
+  set-package:
+    runs-on: ubuntu-latest
+    outputs:
+      package_name: ${{ inputs.package_name }}
+    steps:
+      - name: Validate package name
+        run: |
+          if [[ "${{ inputs.package_name }}" != "skypilot-nightly" && "${{ inputs.package_name }}" != "skypilot" ]]; then
+            echo "Error: package_name must be either 'skypilot-nightly' or 'skypilot'"
+            exit 1
+          fi
+      - name: Echo package name
+        run: echo "Using package ${{ inputs.package_name }}"
+
+  docker-build:
+    needs: set-package
+    uses: ./.github/workflows/docker-build.yaml
+    with:
+      package_name: ${{ needs.set-package.outputs.package_name }}
+    secrets:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+
+  publish-helm:
+    needs: [set-package, docker-build]
+    uses: ./.github/workflows/publish-helm.yml
+    with:
+      version: ${{ needs.docker-build.outputs.version }}
+      commit_message: 'Update Helm charts for ${{ needs.set-package.outputs.package_name }} version ${{ needs.docker-build.outputs.version }}'
+      package_name: ${{ needs.set-package.outputs.package_name }}
+    secrets:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      HELM_DEPLOY_KEY: ${{ secrets.HELM_DEPLOY_KEY }}

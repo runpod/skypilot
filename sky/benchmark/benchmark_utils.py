@@ -20,18 +20,21 @@ from rich import progress as rich_progress
 
 import sky
 from sky import backends
+from sky import clouds
 from sky import data
 from sky import global_user_state
+from sky import optimizer
 from sky import sky_logging
-from sky import status_lib
 from sky.backends import backend_utils
 from sky.benchmark import benchmark_state
+from sky.data import storage as storage_lib
 from sky.skylet import constants
 from sky.skylet import job_lib
 from sky.skylet import log_lib
 from sky.utils import common_utils
 from sky.utils import log_utils
 from sky.utils import rich_utils
+from sky.utils import status_lib
 from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 
@@ -96,9 +99,11 @@ def _get_optimized_resources(
             resources = config.get('resources', None)
             resources = sky.Resources.from_yaml_config(resources)
             task = sky.Task()
-            task.set_resources({resources})
+            task.set_resources(resources)
 
-        dag = sky.optimize(dag, quiet=True)
+        # Do not use `sky.optimize` here, as this should be called on the API
+        # server side.
+        dag = optimizer.Optimizer.optimize(dag, quiet=True)
         task = dag.tasks[0]
         optimized_resources.append(task.best_resources)
     return optimized_resources
@@ -167,23 +172,22 @@ def _create_benchmark_bucket() -> Tuple[str, str]:
     bucket_name = f'sky-bench-{uuid.uuid4().hex[:4]}-{getpass.getuser()}'
 
     # Select the bucket type.
-    enabled_clouds = global_user_state.get_enabled_clouds()
-    enabled_clouds = [str(cloud) for cloud in enabled_clouds]
-    if 'AWS' in enabled_clouds:
-        bucket_type = data.StoreType.S3.value
-    elif 'GCP' in enabled_clouds:
-        bucket_type = data.StoreType.GCS.value
-    elif 'AZURE' in enabled_clouds:
-        raise RuntimeError(
-            'Azure Blob Storage is not supported yet. '
-            'Please enable another cloud to create a benchmark bucket.')
-    else:
-        raise RuntimeError('No cloud is enabled. '
-                           'Please enable at least one cloud.')
+    enabled_clouds = (
+        storage_lib.get_cached_enabled_storage_cloud_names_or_refresh(
+            raise_if_no_cloud_access=True))
+    # Sky Benchmark only supports S3 (see _download_remote_dir and
+    # _delete_remote_dir).
+    enabled_clouds = [
+        cloud for cloud in enabled_clouds if cloud in [str(clouds.AWS())]
+    ]
+    assert enabled_clouds, ('No enabled cloud storage found. Sky Benchmark '
+                            'requires GCP or AWS to store logs.')
+    bucket_type = data.StoreType.from_cloud(enabled_clouds[0]).value
 
     # Create a benchmark bucket.
     logger.info(f'Creating a bucket {bucket_name} to save the benchmark logs.')
     storage = data.Storage(bucket_name, source=None, persistent=True)
+    storage.construct()
     storage.add_store(bucket_type)
 
     # Save the bucket name and type to the config.
@@ -249,14 +253,8 @@ def _download_remote_dir(remote_dir: str, local_dir: str,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=True)
-    elif bucket_type == data.StoreType.GCS:
-        remote_dir = f'gs://{remote_dir}'
-        subprocess.run(['gsutil', '-m', 'cp', '-r', remote_dir, local_dir],
-                       stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL,
-                       check=True)
     else:
-        raise RuntimeError('Azure Blob Storage is not supported yet.')
+        raise RuntimeError(f'{bucket_type} is not supported yet.')
 
 
 def _delete_remote_dir(remote_dir: str, bucket_type: data.StoreType) -> None:
@@ -267,18 +265,12 @@ def _delete_remote_dir(remote_dir: str, bucket_type: data.StoreType) -> None:
                        stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL,
                        check=True)
-    elif bucket_type == data.StoreType.GCS:
-        remote_dir = f'gs://{remote_dir}'
-        subprocess.run(['gsutil', '-m', 'rm', '-r', remote_dir],
-                       stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL,
-                       check=True)
     else:
-        raise RuntimeError('Azure Blob Storage is not supported yet.')
+        raise RuntimeError(f'{bucket_type} is not supported yet.')
 
 
 def _read_timestamp(path: str) -> float:
-    with open(path, 'r') as f:
+    with open(path, 'r', encoding='utf-8') as f:
         timestamp = f.readlines()
     assert len(timestamp) == 1
     return float(timestamp[0].strip())
@@ -301,6 +293,11 @@ def _update_benchmark_result(benchmark_result: Dict[str, Any]) -> Optional[str]:
     run_end_path = os.path.join(local_dir, _RUN_END)
     end_time = None
     if os.path.exists(run_end_path):
+        # The job has terminated with a zero exit code. See
+        # generate_benchmark_configs() which ensures the 'run' commands write
+        # out end_time remotely on success; and the caller of this func which
+        # downloads all benchmark log files including the end_time file to
+        # local.
         end_time = _read_timestamp(run_end_path)
 
     # Get the status of the benchmarking cluster and job.
@@ -310,39 +307,74 @@ def _update_benchmark_result(benchmark_result: Dict[str, Any]) -> Optional[str]:
     if record is not None:
         cluster_status, handle = backend_utils.refresh_cluster_status_handle(
             cluster)
-        backend = backend_utils.get_backend_from_handle(handle)
-        assert isinstance(backend, backends.CloudVmRayBackend)
+        if handle is not None:
+            backend = backend_utils.get_backend_from_handle(handle)
+            assert isinstance(backend, backends.CloudVmRayBackend)
 
-        if cluster_status == status_lib.ClusterStatus.UP:
-            # NOTE: The id of the benchmarking job must be 1.
-            # TODO(woosuk): Handle exceptions.
-            job_status = backend.get_job_status(handle,
-                                                job_ids=[1],
-                                                stream_logs=False)[1]
+            if cluster_status == status_lib.ClusterStatus.UP:
+                # NOTE: The id of the benchmarking job must be 1.
+                # TODO(woosuk): Handle exceptions.
+                job_status = backend.get_job_status(handle,
+                                                    job_ids=[1],
+                                                    stream_logs=False)[1]
+
+    logger.debug(f'Cluster {cluster}, cluster_status: {cluster_status}, '
+                 f'benchmark_status {benchmark_status}, job_status: '
+                 f'{job_status}, start_time {start_time}, end_time {end_time}')
 
     # Update the benchmark status.
-    if (cluster_status == status_lib.ClusterStatus.INIT or
-            job_status < job_lib.JobStatus.RUNNING):
+    if end_time is not None:
+        # The job has terminated with zero exit code.
+        benchmark_status = benchmark_state.BenchmarkStatus.FINISHED
+    elif cluster_status is None:
+        # Candidate cluster: preempted or never successfully launched.
+        #
+        # Note that benchmark record is only inserted after all clusters
+        # finished launch() (successful or not). See
+        # launch_benchmark_clusters(). So this case doesn't include "just before
+        # candidate cluster's launch() is called".
+
+        # See above: if cluster_status is not UP, job_status is defined as None.
+        assert job_status is None, job_status
+        benchmark_status = benchmark_state.BenchmarkStatus.TERMINATED
+    elif cluster_status == status_lib.ClusterStatus.INIT:
+        # Candidate cluster's launch has something gone wrong, or is still
+        # launching.
+
+        # See above: if cluster_status is not UP, job_status is defined as None.
+        assert job_status is None, job_status
         benchmark_status = benchmark_state.BenchmarkStatus.INIT
-    elif job_status == job_lib.JobStatus.RUNNING:
-        benchmark_status = benchmark_state.BenchmarkStatus.RUNNING
-    elif (cluster_status is None or
-          cluster_status == status_lib.ClusterStatus.STOPPED or
-          (job_status is not None and job_status.is_terminal())):
-        # The cluster has terminated or stopped, or
-        # the cluster is UP and the job has terminated.
-        if end_time is not None:
-            # The job has terminated with zero exit code.
-            benchmark_status = benchmark_state.BenchmarkStatus.FINISHED
-        elif job_status == job_lib.JobStatus.SUCCEEDED:
-            # Since we download the benchmark logs before checking the cluster
-            # status, there is a chance that the end timestamp is saved
-            # and the cluster is stopped AFTER we download the logs.
-            # In this case, we consider the current timestamp as the end time.
-            end_time = time.time()
-            benchmark_status = benchmark_state.BenchmarkStatus.FINISHED
+    elif cluster_status == status_lib.ClusterStatus.STOPPED:
+        # Candidate cluster is auto-stopped, or user manually stops it at any
+        # time. Also, end_time is None.
+
+        # See above: if cluster_status is not UP, job_status is defined as None.
+        assert job_status is None, job_status
+        benchmark_status = benchmark_state.BenchmarkStatus.TERMINATED
+    else:
+        assert cluster_status == status_lib.ClusterStatus.UP, (
+            'ClusterStatus enum should have been handled')
+        if job_status is None:
+            benchmark_status = benchmark_state.BenchmarkStatus.INIT
         else:
-            benchmark_status = benchmark_state.BenchmarkStatus.TERMINATED
+            if job_status < job_lib.JobStatus.RUNNING:
+                benchmark_status = benchmark_state.BenchmarkStatus.INIT
+            elif job_status == job_lib.JobStatus.RUNNING:
+                benchmark_status = benchmark_state.BenchmarkStatus.RUNNING
+            else:
+                assert job_status.is_terminal(), '> RUNNING means terminal'
+                # Case: cluster_status UP, job_status.is_terminal()
+                if job_status == job_lib.JobStatus.SUCCEEDED:
+                    # Since we download the benchmark logs before checking the
+                    # cluster status, there is a chance that the end timestamp
+                    # is saved and the cluster is stopped AFTER we download the
+                    # logs.  In this case, we consider the current timestamp as
+                    # the end time.
+                    end_time = time.time()
+                    benchmark_status = benchmark_state.BenchmarkStatus.FINISHED
+                else:
+                    benchmark_status = (
+                        benchmark_state.BenchmarkStatus.TERMINATED)
 
     callback_log_dirs = glob.glob(os.path.join(local_dir, 'sky-callback-*'))
     if callback_log_dirs:
@@ -356,7 +388,7 @@ def _update_benchmark_result(benchmark_result: Dict[str, Any]) -> Optional[str]:
     message = None
     if summary_path is not None and os.path.exists(summary_path):
         # (1) SkyCallback has saved the summary.
-        with open(summary_path, 'r') as f:
+        with open(summary_path, 'r', encoding='utf-8') as f:
             summary = json.load(f)
         if end_time is None:
             last_time = summary['last_step_time']
@@ -508,7 +540,7 @@ def launch_benchmark_clusters(benchmark: str, clusters: List[str],
                    for yaml_fd, cluster in zip(yaml_fds, clusters)]
 
     # Save stdout/stderr from cluster launches.
-    run_timestamp = backend_utils.get_run_timestamp()
+    run_timestamp = sky_logging.get_run_timestamp()
     log_dir = os.path.join(constants.SKY_LOGS_DIRECTORY, run_timestamp)
     log_dir = os.path.expanduser(log_dir)
     logger.info(
@@ -568,7 +600,8 @@ def update_benchmark_state(benchmark: str) -> None:
     remote_dir = os.path.join(bucket_name, benchmark)
     local_dir = os.path.join(_SKY_LOCAL_BENCHMARK_DIR, benchmark)
     os.makedirs(local_dir, exist_ok=True)
-    with rich_utils.safe_status('[bold cyan]Downloading benchmark logs[/]'):
+    with rich_utils.safe_status(
+            ux_utils.spinner_message('Downloading benchmark logs')):
         _download_remote_dir(remote_dir, local_dir, bucket_type)
 
     # Update the benchmark results in parallel.
@@ -577,9 +610,9 @@ def update_benchmark_state(benchmark: str) -> None:
     progress = rich_progress.Progress(transient=True,
                                       redirect_stdout=False,
                                       redirect_stderr=False)
-    task = progress.add_task(
-        f'[bold cyan]Processing {num_candidates} benchmark result{plural}[/]',
-        total=num_candidates)
+    task = progress.add_task(ux_utils.spinner_message(
+        f'Processing {num_candidates} benchmark result{plural}'),
+                             total=num_candidates)
 
     def _update_with_progress_bar(arg: Any) -> None:
         message = _update_benchmark_result(arg)

@@ -5,6 +5,14 @@ name: a
 
 num_nodes: 2
 
+resources:
+  cpus: 2
+  memory: 4+
+  any_of:
+    - infra: aws
+    - infra: gcp
+
+
 setup: |
   echo setup for train
 
@@ -14,6 +22,14 @@ run: |
 
 ---
 name: b
+
+resources:
+  cpus: 2
+  memory: 4+
+  any_of:
+    - infra: aws
+    - infra: gcp
+
 
 setup: |
   exit 1
@@ -27,6 +43,13 @@ run: |
 
 name: eval1
 
+resources:
+  cpus: 2
+  memory: 4+
+  any_of:
+    - infra: aws
+    - infra: gcp
+
 setup: |
   echo setup for eval
   sleep 20
@@ -39,6 +62,13 @@ run: |
 ---
 
 name: eval2
+
+resources:
+  cpus: 2
+  memory: 4+
+  any_of:
+    - infra: aws
+    - infra: gcp
 
 setup: |
   echo setup for eval

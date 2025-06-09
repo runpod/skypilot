@@ -3,12 +3,13 @@ import textwrap
 
 import pytest
 
+from sky.exceptions import InvalidSkyPilotConfigError
 from sky.task import Task
 
 
 def _create_config_file(config: str, tmp_path: pathlib.Path) -> str:
     config_path = tmp_path / 'config.yaml'
-    config_path.open('w').write(config)
+    config_path.open('w', encoding='utf-8').write(config)
     return config_path
 
 
@@ -69,6 +70,33 @@ def test_empty_fields_resources(tmp_path):
     assert resources.cpus == '32'
 
 
+def test_gpu_resources(tmp_path):
+    config_path = _create_config_file(
+        textwrap.dedent("""\
+            resources:
+                gpus: V100:1
+            """), tmp_path)
+    task = Task.from_yaml(config_path)
+
+    resources = list(task.resources)[0]
+    assert resources.accelerators == {'V100': 1}
+
+
+def test_both_gpus_and_accelerators_raises_config_error(tmp_path):
+    """Aliased and canonical names cannot both be specified in config."""
+    config_path = _create_config_file(
+        textwrap.dedent("""\
+            resources:
+                accelerators: V100:1
+                gpus: [T4:4, V100:8]
+            """), tmp_path)
+
+    with pytest.raises(InvalidSkyPilotConfigError) as e:
+        Task.from_yaml(config_path)
+    assert e.value.args[
+        0] == "Cannot specify both gpus and accelerators in config."
+
+
 def test_invalid_fields_resources(tmp_path):
     config_path = _create_config_file(
         textwrap.dedent(f"""\
@@ -96,8 +124,8 @@ def test_empty_fields_storage(tmp_path):
     storage = task.storage_mounts['/mystorage']
     assert storage.name == 'sky-dataset'
     assert storage.source is None
-    assert len(storage.stores) == 0
-    assert storage.persistent is True
+    assert not storage.stores
+    assert storage.persistent
 
 
 def test_invalid_fields_storage(tmp_path):
@@ -111,3 +139,49 @@ def test_invalid_fields_storage(tmp_path):
     with pytest.raises(AssertionError) as e:
         Task.from_yaml(config_path)
     assert 'Invalid storage args' in e.value.args[0]
+
+
+def test_invalid_envs_key(tmp_path):
+    config_path = _create_config_file(
+        textwrap.dedent(f"""\
+            envs:
+                invalid_env_$_key: value
+            """), tmp_path)
+    with pytest.raises(ValueError) as e:
+        Task.from_yaml(config_path)
+    assert 'does not match any of the regexes:' in e.value.args[0]
+
+
+def test_invalid_envs_type(tmp_path):
+    config_path = _create_config_file(
+        textwrap.dedent(f"""\
+            envs:
+                - env_key1: abc
+                - env_key2: abc
+            """), tmp_path)
+    with pytest.raises(ValueError) as e:
+        Task.from_yaml(config_path)
+    assert 'is not of type \'dict\'' in e.value.args[0]
+
+
+def test_invalid_empty_envs(tmp_path):
+    config_path = _create_config_file(
+        textwrap.dedent(f"""\
+            envs:
+                env_key1: abc
+                env_key2:
+            """), tmp_path)
+    with pytest.raises(ValueError) as e:
+        Task.from_yaml(config_path)
+    assert 'Environment variable \'env_key2\' is None.' in e.value.args[0]
+
+
+def test_replace_envs_in_workdir(tmpdir, tmp_path):
+    config_path = _create_config_file(
+        textwrap.dedent(f"""\
+            envs:
+                env_key1: {tmpdir}
+            workdir: $env_key1
+            """), tmp_path)
+    task = Task.from_yaml(config_path)
+    assert task.workdir == tmpdir

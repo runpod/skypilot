@@ -5,27 +5,34 @@ in this or config module, please make sure to reload it as in
 _default_ec2_resource() to avoid version mismatch issues.
 """
 import copy
+import logging
+from multiprocessing import pool
 import re
 import time
-from typing import Any, Dict, List, Optional, Set
+import typing
+from typing import Any, Callable, Dict, List, Optional, Set, TypeVar
 
 from sky import sky_logging
-from sky import status_lib
 from sky.adaptors import aws
 from sky.clouds import aws as aws_cloud
+from sky.clouds.utils import aws_utils
 from sky.provision import common
+from sky.provision import constants
 from sky.provision.aws import utils
 from sky.utils import common_utils
 from sky.utils import resources_utils
+from sky.utils import status_lib
 from sky.utils import ux_utils
+
+if typing.TYPE_CHECKING:
+    from botocore import waiter as botowaiter
+    import mypy_boto3_ec2
+    from mypy_boto3_ec2 import type_defs as ec2_type_defs
 
 logger = sky_logging.init_logger(__name__)
 
-# Tag uniquely identifying all nodes of a cluster
-TAG_RAY_CLUSTER_NAME = 'ray-cluster-name'
-TAG_SKYPILOT_CLUSTER_NAME = 'skypilot-cluster-name'
-TAG_RAY_NODE_KIND = 'ray-node-type'  # legacy tag for backward compatibility
-TAG_SKYPILOT_HEAD_NODE = 'skypilot-head-node'
+_T = TypeVar('_T')
+
 # Max retries for general AWS API calls.
 BOTO_MAX_RETRIES = 12
 # Max retries for creating an instance.
@@ -36,6 +43,9 @@ BOTO_DELETE_MAX_ATTEMPTS = 6
 _DEPENDENCY_VIOLATION_PATTERN = re.compile(
     r'An error occurred \(DependencyViolation\) when calling the '
     r'DeleteSecurityGroup operation(.*): (.*)')
+
+_RESUME_INSTANCE_TIMEOUT = 480  # 8 minutes
+_RESUME_PER_INSTANCE_TIMEOUT = 120  # 2 minutes
 
 # ======================== About AWS subnet/VPC ========================
 # https://stackoverflow.com/questions/37407492/are-there-differences-in-networking-performance-if-ec2-instances-are-in-differen
@@ -51,20 +61,22 @@ _DEPENDENCY_VIOLATION_PATTERN = re.compile(
 # https://aws.amazon.com/ec2/pricing/on-demand/#Data_Transfer_within_the_same_AWS_Region
 
 
-def _default_ec2_resource(region: str) -> Any:
+def _default_ec2_resource(
+        region: str,
+        check_credentials: bool = True) -> 'mypy_boto3_ec2.ServiceResource':
     if not hasattr(aws, 'version'):
         # For backward compatibility, reload the module if the aws module was
-        # imported before and stale. Used for, e.g., a live spot controller
+        # imported before and stale. Used for, e.g., a live jobs controller
         # running an older version and a new version gets installed by
-        # `sky spot launch`.
+        # `sky jobs launch`.
         #
         # Detailed explanation follows. Assume we're in this situation: an old
-        # spot controller running a spot job and then the code gets updated on
-        # the controller due to a new `sky spot launch` or `sky start`.
+        # jobs controller running a managed job and then the code gets updated
+        # on the controller due to a new `sky jobs launch or `sky start`.
         #
-        # First, controller consists of an outer process (sky.spot.controller's
+        # First, controller consists of an outer process (sky.jobs.controller's
         # main) and an inner process running the controller logic (started as a
-        # multiprocessing.Process in sky.spot.controller). `sky.provision.aws`
+        # multiprocessing.Process in sky.jobs.controller). `sky.provision.aws`
         # is only imported in the inner process due to its load-on-use
         # semantics.
         #
@@ -72,8 +84,8 @@ def _default_ec2_resource(region: str) -> Any:
         # {old sky.provision.aws, old sky.adaptors.aws}, and outer process has
         # loaded {old sky.adaptors.aws}.
         #
-        # In controller.py's start(), the inner process may exit due to spot job
-        # exits or `sky spot cancel`, entering outer process'
+        # In controller.py's start(), the inner process may exit due to managed
+        # job exits or `sky jobs cancel`, entering outer process'
         # `finally: ... _cleanup()` path. Inside _cleanup(), we eventually call
         # into `sky.provision.aws` which loads this module for the first time
         # for the outer process. At this point, outer process has loaded
@@ -91,14 +103,49 @@ def _default_ec2_resource(region: str) -> Any:
         importlib.reload(aws)
     return aws.resource('ec2',
                         region_name=region,
-                        max_attempts=BOTO_MAX_RETRIES)
+                        max_attempts=BOTO_MAX_RETRIES,
+                        check_credentials=check_credentials)
 
 
-def _cluster_name_filter(cluster_name_on_cloud: str) -> List[Dict[str, Any]]:
+def _cluster_name_filter(
+        cluster_name_on_cloud: str) -> List['ec2_type_defs.FilterTypeDef']:
     return [{
-        'Name': f'tag:{TAG_RAY_CLUSTER_NAME}',
+        'Name': f'tag:{constants.TAG_RAY_CLUSTER_NAME}',
         'Values': [cluster_name_on_cloud],
     }]
+
+
+def _ec2_call_with_retry_on_server_error(ec2_fail_fast_fn: Callable[..., _T],
+                                         log_level=logging.DEBUG,
+                                         **kwargs) -> _T:
+    # Here we have to handle 'RequestLimitExceeded' error, so the provision
+    # would not fail due to request limit issues.
+    # Here the backoff config (5, 12) is picked at random and does not
+    # have any special meaning.
+    backoff = common_utils.Backoff(initial_backoff=5, max_backoff_factor=12)
+    ret = None
+    for _ in range(utils.BOTO_MAX_RETRIES):
+        try:
+            ret = ec2_fail_fast_fn(**kwargs)
+            break
+        except aws.botocore_exceptions().ClientError as e:
+            # Retry server side errors, as they are likely to be transient.
+            # https://docs.aws.amazon.com/AWSEC2/latest/APIReference/errors-overview.html#api-error-codes-table-server # pylint: disable=line-too-long
+            error_code = e.response['Error']['Code']
+            if error_code in [
+                    'RequestLimitExceeded', 'ServerInternal',
+                    'ServiceUnavailable', 'InternalError', 'Unavailable'
+            ]:
+                time.sleep(backoff.current_backoff())
+                logger.debug(f'create_instances: {error_code}, retrying.')
+                continue
+            logger.log(log_level, f'create_instances: Attempt failed with {e}')
+            raise
+    if ret is None:
+        raise RuntimeError(
+            f'Failed to call ec2 function {ec2_fail_fast_fn} due to '
+            'RequestLimitExceeded. Max attempts exceeded.')
+    return ret
 
 
 def _format_tags(tags: Dict[str, str]) -> List:
@@ -136,13 +183,13 @@ def _merge_tag_specs(tag_specs: List[Dict[str, Any]],
             tag_specs += [user_tag_spec]
 
 
-def _create_instances(ec2_fail_fast, cluster_name: str, node_config: Dict[str,
-                                                                          Any],
-                      tags: Dict[str, str], count: int) -> List:
+def _create_instances(ec2_fail_fast, cluster_name: str,
+                      node_config: Dict[str, Any], tags: Dict[str, str],
+                      count: int, associate_public_ip_address: bool) -> List:
     tags = {
         'Name': cluster_name,
-        TAG_RAY_CLUSTER_NAME: cluster_name,
-        TAG_SKYPILOT_CLUSTER_NAME: cluster_name,
+        constants.TAG_RAY_CLUSTER_NAME: cluster_name,
+        constants.TAG_SKYPILOT_CLUSTER_NAME: cluster_name,
         **tags
     }
     conf = node_config.copy()
@@ -165,6 +212,15 @@ def _create_instances(ec2_fail_fast, cluster_name: str, node_config: Dict[str,
         'TagSpecifications': tag_specs
     })
 
+    # We are adding 'NetworkInterfaces' in the inner loop and having both keys
+    # is considered invalid by the create_instances API.
+    security_group_ids = conf.pop('SecurityGroupIds', None)
+    # Guaranteed by config.py (the bootstrapping phase):
+    assert 'NetworkInterfaces' not in conf, conf
+    assert security_group_ids is not None, conf
+
+    logger.debug(f'Creating {count} instances with config: \n{conf}')
+
     # NOTE: This ensures that we try ALL availability zones before
     # throwing an error.
     num_subnets = len(subnet_ids)
@@ -173,41 +229,20 @@ def _create_instances(ec2_fail_fast, cluster_name: str, node_config: Dict[str,
     per_subnet_tries = max_tries // num_subnets
     for i in range(max_tries):
         try:
-            if 'NetworkInterfaces' in conf:
-                logger.debug(
-                    'Attempting to create instances with NetworkInterfaces.'
-                    'Ignore SecurityGroupIds.')
-                # remove security group IDs previously copied from network
-                # interfaces (create_instances call fails otherwise)
-                conf.pop('SecurityGroupIds', None)
-            else:
-                # Try each subnet for per_subnet_tries times.
-                subnet_id = subnet_ids[i // per_subnet_tries]
-                conf['SubnetId'] = subnet_id
+            # Try each subnet for per_subnet_tries times.
+            subnet_id = subnet_ids[i // per_subnet_tries]
 
-            # NOTE: We set retry=0 for fast failing when the resource is not
-            # available. Here we have to handle 'RequestLimitExceeded'
-            # error, so the provision would not fail due to request limit
-            # issues.
-            # Here the backoff config (5, 12) is picked at random and does not
-            # have any special meaning.
-            backoff = common_utils.Backoff(5, 12)
-            instances = None
-            for _ in range(utils.BOTO_MAX_RETRIES):
-                try:
-                    instances = ec2_fail_fast.create_instances(**conf)
-                    break
-                except aws.botocore_exceptions().ClientError as e:
-                    if e.response['Error']['Code'] == 'RequestLimitExceeded':
-                        time.sleep(backoff.current_backoff())
-                        logger.warning(
-                            'create_instances: RequestLimitExceeded, retrying.')
-                        continue
-                    raise
-            if instances is None:
-                raise RuntimeError(
-                    'Failed to launch instances due to RequestLimitExceeded. '
-                    'Max attempts exceeded.')
+            network_interfaces = [{
+                'SubnetId': subnet_id,
+                'DeviceIndex': 0,
+                # Whether the VM(s) should have a public IP.
+                'AssociatePublicIpAddress': associate_public_ip_address,
+                'Groups': security_group_ids,
+            }]
+            conf['NetworkInterfaces'] = network_interfaces
+
+            instances = _ec2_call_with_retry_on_server_error(
+                ec2_fail_fast.create_instances, **conf)
             return instances
         except aws.botocore_exceptions().ClientError as exc:
             echo = logger.debug
@@ -224,10 +259,8 @@ def _create_instances(ec2_fail_fast, cluster_name: str, node_config: Dict[str,
 
 def _get_head_instance_id(instances: List) -> Optional[str]:
     head_instance_id = None
-    head_node_markers = (
-        (TAG_SKYPILOT_HEAD_NODE, '1'),
-        (TAG_RAY_NODE_KIND, 'head'),  # backward compat with Ray
-    )
+    head_node_markers = tuple(constants.HEAD_NODE_TAGS.items())
+
     for inst in instances:
         for t in inst.tags:
             if (t['Key'], t['Value']) in head_node_markers:
@@ -246,6 +279,10 @@ def run_instances(region: str, cluster_name_on_cloud: str,
                   config: common.ProvisionConfig) -> common.ProvisionRecord:
     """See sky/provision/__init__.py"""
     ec2 = _default_ec2_resource(region)
+    # NOTE: We set max_attempts=0 for fast failing when the resource is not
+    # available (although the doc says it will only retry for network
+    # issues, practically, it retries for capacity errors, etc as well).
+    ec2_fail_fast = aws.resource('ec2', region_name=region, max_attempts=0)
 
     region = ec2.meta.client.meta.region_name
     zone = None
@@ -254,11 +291,11 @@ def run_instances(region: str, cluster_name_on_cloud: str,
 
     # sort tags by key to support deterministic unit test stubbing
     tags = dict(sorted(copy.deepcopy(config.tags).items()))
-    filters = [{
+    filters: List['ec2_type_defs.FilterTypeDef'] = [{
         'Name': 'instance-state-name',
         'Values': ['pending', 'running', 'stopping', 'stopped'],
     }, {
-        'Name': f'tag:{TAG_RAY_CLUSTER_NAME}',
+        'Name': f'tag:{constants.TAG_RAY_CLUSTER_NAME}',
         'Values': [cluster_name_on_cloud],
     }]
     exist_instances = list(ec2.instances.filter(Filters=filters))
@@ -284,31 +321,27 @@ def run_instances(region: str, cluster_name_on_cloud: str,
             raise RuntimeError(f'Impossible state "{state}".')
 
     def _create_node_tag(target_instance, is_head: bool = True) -> str:
+        node_type_tags = (constants.HEAD_NODE_TAGS
+                          if is_head else constants.WORKER_NODE_TAGS)
+        node_tag = [{'Key': k, 'Value': v} for k, v in node_type_tags.items()]
         if is_head:
-            node_tag = [{
-                'Key': TAG_SKYPILOT_HEAD_NODE,
-                'Value': '1'
-            }, {
-                'Key': TAG_RAY_NODE_KIND,
-                'Value': 'head'
-            }, {
+            node_tag.append({
                 'Key': 'Name',
                 'Value': f'sky-{cluster_name_on_cloud}-head'
-            }]
+            })
         else:
-            node_tag = [{
-                'Key': TAG_SKYPILOT_HEAD_NODE,
-                'Value': '0'
-            }, {
-                'Key': TAG_RAY_NODE_KIND,
-                'Value': 'worker'
-            }, {
+            node_tag.append({
                 'Key': 'Name',
                 'Value': f'sky-{cluster_name_on_cloud}-worker'
-            }]
+            })
+        # Remove AWS internal tags, as they are not allowed to be set by users.
+        target_instance_tags = [
+            tag for tag in target_instance.tags
+            if not tag['Key'].startswith('aws:')
+        ]
         ec2.meta.client.create_tags(
             Resources=[target_instance.id],
-            Tags=target_instance.tags + node_tag,
+            Tags=target_instance_tags + node_tag,
         )
         return target_instance.id
 
@@ -347,22 +380,59 @@ def run_instances(region: str, cluster_name_on_cloud: str,
     # Try to reuse previously stopped nodes with compatible configs
     if config.resume_stopped_nodes and to_start_count > 0 and (
             stopping_instances or stopped_instances):
-        for inst in stopping_instances:
-            if to_start_count <= len(stopped_instances):
-                break
-            inst.wait_until_stopped()
+        time_start = time.time()
+        if stopping_instances:
+            plural = 's' if len(stopping_instances) > 1 else ''
+            verb = 'are' if len(stopping_instances) > 1 else 'is'
+            logger.warning(
+                f'Instance{plural} {stopping_instances} {verb} still in '
+                'STOPPING state on AWS. It can only be resumed after it is '
+                'fully STOPPED. Waiting ...')
+        while (stopping_instances and
+               to_start_count > len(stopped_instances) and
+               time.time() - time_start < _RESUME_INSTANCE_TIMEOUT):
+            inst = stopping_instances.pop(0)
+            with pool.ThreadPool(processes=1) as pool_:
+                # wait_until_stopped() is a blocking call, and sometimes it can
+                # take significant time to return due to AWS keeping the
+                # instance in STOPPING state. We add a timeout for it to make
+                # SkyPilot more responsive.
+                fut = pool_.apply_async(inst.wait_until_stopped)
+                per_instance_time_start = time.time()
+                while (time.time() - per_instance_time_start <
+                       _RESUME_PER_INSTANCE_TIMEOUT):
+                    if fut.ready():
+                        fut.get()
+                        break
+                    time.sleep(1)
+                else:
+                    logger.warning(
+                        f'Instance {inst.id} is still in stopping state '
+                        f'(Timeout: {_RESUME_PER_INSTANCE_TIMEOUT}). '
+                        'Retrying ...')
+                    stopping_instances.append(inst)
+                    time.sleep(5)
+                    continue
             stopped_instances.append(inst)
+        if stopping_instances and to_start_count > len(stopped_instances):
+            msg = ('Timeout for waiting for existing instances '
+                   f'{stopping_instances} in STOPPING state to '
+                   'be STOPPED before restarting them. Please try again later.')
+            logger.error(msg)
+            raise RuntimeError(msg)
 
         resumed_instances = stopped_instances[:to_start_count]
         resumed_instances.sort(key=lambda x: x.id)
         resumed_instance_ids = [t.id for t in resumed_instances]
-        ec2.meta.client.start_instances(InstanceIds=resumed_instance_ids)
+        logger.debug(f'Resuming stopped instances {resumed_instance_ids}.')
+        _ec2_call_with_retry_on_server_error(
+            ec2_fail_fast.meta.client.start_instances,
+            InstanceIds=resumed_instance_ids,
+            log_level=logging.WARNING)
         if tags:
             # empty tags will result in error in the API call
-            ec2.meta.client.create_tags(
-                Resources=resumed_instance_ids,
-                Tags=_format_tags(tags),
-            )
+            ec2.meta.client.create_tags(Resources=resumed_instance_ids,
+                                        Tags=_format_tags(tags))
             for inst in resumed_instances:
                 inst.tags = _format_tags(tags)  # sync the tags info
         placement_zone = resumed_instances[0].placement['AvailabilityZone']
@@ -377,16 +447,87 @@ def run_instances(region: str, cluster_name_on_cloud: str,
             head_instance_id = _create_node_tag(resumed_instances[0])
 
     if to_start_count > 0:
+        target_reservation_names = (config.node_config.get(
+            'CapacityReservationSpecification',
+            {}).get('CapacityReservationTarget',
+                    {}).get('CapacityReservationId', []))
+        created_instances = []
+        if target_reservation_names:
+            node_config = copy.deepcopy(config.node_config)
+            # Clear the capacity reservation specification settings in the
+            # original node config, as we will create instances with
+            # reservations with specific settings for each reservation.
+            node_config['CapacityReservationSpecification'] = {
+                'CapacityReservationTarget': {}
+            }
+
+            reservations = aws_utils.list_reservations_for_instance_type(
+                node_config['InstanceType'], region=region)
+            # Filter the reservations by the user-specified ones, because
+            # reservations contain 'open' reservations as well, which do not
+            # need to explicitly specify in the config for creating instances.
+            target_reservations = []
+            for r in reservations:
+                if (r.targeted and r.name in target_reservation_names):
+                    target_reservations.append(r)
+            logger.debug(f'Reservations: {reservations}')
+            logger.debug(f'Target reservations: {target_reservations}')
+
+            target_reservations_list = sorted(
+                target_reservations,
+                key=lambda x: x.available_resources,
+                reverse=True)
+            for r in target_reservations_list:
+                if r.available_resources <= 0:
+                    # We have sorted the reservations by the available
+                    # resources, so if the reservation is not available, the
+                    # following reservations are not available either.
+                    break
+                reservation_count = min(r.available_resources, to_start_count)
+                logger.debug(f'Creating {reservation_count} instances '
+                             f'with reservation {r.name}')
+                node_config['CapacityReservationSpecification'][
+                    'CapacityReservationTarget'] = {
+                        'CapacityReservationId': r.name
+                    }
+                if r.type == aws_utils.ReservationType.BLOCK:
+                    # Capacity block reservations needs to specify the market
+                    # type during instance creation.
+                    node_config['InstanceMarketOptions'] = {
+                        'MarketType': aws_utils.ReservationType.BLOCK.value
+                    }
+                created_reserved_instances = _create_instances(
+                    ec2_fail_fast,
+                    cluster_name_on_cloud,
+                    node_config,
+                    tags,
+                    reservation_count,
+                    associate_public_ip_address=(
+                        not config.provider_config['use_internal_ips']))
+                created_instances.extend(created_reserved_instances)
+                to_start_count -= reservation_count
+                if to_start_count <= 0:
+                    break
+
         # TODO(suquark): If there are existing instances (already running or
         #  resumed), then we cannot guarantee that they will be in the same
         #  availability zone (when there are multiple zones specified).
         #  This is a known issue before.
-        ec2_fail_fast = aws.resource('ec2', region_name=region, max_attempts=0)
 
-        created_instances = _create_instances(ec2_fail_fast,
-                                              cluster_name_on_cloud,
-                                              config.node_config, tags,
-                                              to_start_count)
+        if to_start_count > 0:
+            # Remove the capacity reservation specification from the node config
+            # as we have already created the instances with the reservations.
+            config.node_config.get('CapacityReservationSpecification',
+                                   {}).pop('CapacityReservationTarget', None)
+            created_remaining_instances = _create_instances(
+                ec2_fail_fast,
+                cluster_name_on_cloud,
+                config.node_config,
+                tags,
+                to_start_count,
+                associate_public_ip_address=(
+                    not config.provider_config['use_internal_ips']))
+            created_instances.extend(created_remaining_instances)
         created_instances.sort(key=lambda x: x.id)
 
         created_instance_ids = [n.id for n in created_instances]
@@ -419,7 +560,8 @@ def run_instances(region: str, cluster_name_on_cloud: str,
                                   created_instance_ids=created_instance_ids)
 
 
-def _filter_instances(ec2, filters: List[Dict[str, Any]],
+def _filter_instances(ec2: 'mypy_boto3_ec2.ServiceResource',
+                      filters: List['ec2_type_defs.FilterTypeDef'],
                       included_instances: Optional[List[str]],
                       excluded_instances: Optional[List[str]]):
     instances = ec2.instances.filter(Filters=filters)
@@ -484,7 +626,7 @@ def stop_instances(
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
     region = provider_config['region']
     ec2 = _default_ec2_resource(region)
-    filters: List[Dict[str, Any]] = [
+    filters: List['ec2_type_defs.FilterTypeDef'] = [
         {
             'Name': 'instance-state-name',
             'Values': ['pending', 'running'],
@@ -493,7 +635,7 @@ def stop_instances(
     ]
     if worker_only:
         filters.append({
-            'Name': f'tag:{TAG_RAY_NODE_KIND}',
+            'Name': f'tag:{constants.TAG_RAY_NODE_KIND}',
             'Values': ['worker'],
         })
     instances = _filter_instances(ec2,
@@ -518,8 +660,10 @@ def terminate_instances(
     assert provider_config is not None, (cluster_name_on_cloud, provider_config)
     region = provider_config['region']
     sg_name = provider_config['security_group']['GroupName']
+    managed_by_skypilot = provider_config['security_group'].get(
+        'ManagedBySkyPilot', True)
     ec2 = _default_ec2_resource(region)
-    filters = [
+    filters: List['ec2_type_defs.FilterTypeDef'] = [
         {
             'Name': 'instance-state-name',
             # exclude 'shutting-down' or 'terminated' states
@@ -529,7 +673,7 @@ def terminate_instances(
     ]
     if worker_only:
         filters.append({
-            'Name': f'tag:{TAG_RAY_NODE_KIND}',
+            'Name': f'tag:{constants.TAG_RAY_NODE_KIND}',
             'Values': ['worker'],
         })
     # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ec2.html#EC2.Instance
@@ -537,15 +681,18 @@ def terminate_instances(
                                   filters,
                                   included_instances=None,
                                   excluded_instances=None)
+    instances_list = list(instances)
     instances.terminate()
-    if sg_name == aws_cloud.DEFAULT_SECURITY_GROUP_NAME:
-        # Using default AWS SG. We don't need to wait for the
-        # termination of the instances.
+    if (sg_name == aws_cloud.DEFAULT_SECURITY_GROUP_NAME or
+            not managed_by_skypilot):
+        # Using default AWS SG or user specified security group. We don't need
+        # to wait for the termination of the instances, as we do not need to
+        # delete the SG.
         return
     # If ports are specified, we need to delete the newly created Security
     # Group. Here we wait for all instances to be terminated, since the
     # Security Group dependent on them.
-    for instance in instances:
+    for instance in instances_list:
         instance.wait_until_terminated()
     # TODO(suquark): Currently, the implementation of GCP and Azure will
     #  wait util the cluster is fully terminated, while other clouds just
@@ -614,7 +761,7 @@ def open_ports(
     region = provider_config['region']
     ec2 = _default_ec2_resource(region)
     sg_name = provider_config['security_group']['GroupName']
-    filters = [
+    filters: List['ec2_type_defs.FilterTypeDef'] = [
         {
             'Name': 'instance-state-name',
             # exclude 'shutting-down' or 'terminated' states
@@ -643,16 +790,34 @@ def open_ports(
 
     existing_ports: Set[int] = set()
     for existing_rule in sg.ip_permissions:
-        # Skip any non-tcp rules.
-        if existing_rule['IpProtocol'] != 'tcp':
+        # Skip any non-tcp rules or if all traffic (-1) is specified.
+        if existing_rule['IpProtocol'] not in ['tcp', '-1']:
             continue
         # Skip any rules that don't have a FromPort or ToPort.
-        if 'FromPort' not in existing_rule or 'ToPort' not in existing_rule:
-            continue
-        existing_ports.update(
-            range(existing_rule['FromPort'], existing_rule['ToPort'] + 1))
-    ports_to_open = resources_utils.port_set_to_ranges(
-        resources_utils.port_ranges_to_set(ports) - existing_ports)
+        if 'FromPort' in existing_rule and 'ToPort' in existing_rule:
+            existing_ports.update(
+                range(existing_rule['FromPort'], existing_rule['ToPort'] + 1))
+        elif existing_rule['IpProtocol'] == '-1':
+            # For AWS, IpProtocol = -1 means all traffic
+            all_traffic_allowed: bool = False
+            for group_pairs in existing_rule['UserIdGroupPairs']:
+                if group_pairs['GroupId'] != sg.id:
+                    # We skip the port opening when the rule allows access from
+                    # other security groups, as that is likely added by a user
+                    # manually and satisfy their requirement.
+                    # The security group created by SkyPilot allows all traffic
+                    # from the same security group, which should not be skipped.
+                    existing_ports.add(-1)
+                    all_traffic_allowed = True
+                    break
+            if all_traffic_allowed:
+                break
+
+    ports_to_open = []
+    # Do not need to open any ports when all traffic is already allowed.
+    if -1 not in existing_ports:
+        ports_to_open = resources_utils.port_set_to_ranges(
+            resources_utils.port_ranges_to_set(ports) - existing_ports)
 
     ip_permissions = []
     for port in ports_to_open:
@@ -671,21 +836,43 @@ def open_ports(
 
     # For the case when every new ports is already opened.
     if ip_permissions:
-        sg.authorize_ingress(IpPermissions=ip_permissions)
+        # Filter out any permissions that already exist in the security group
+        existing_permissions = set()
+        for rule in sg.ip_permissions:
+            if rule['IpProtocol'] == 'tcp':
+                for ip_range in rule.get('IpRanges', []):
+                    if ip_range.get('CidrIp') == '0.0.0.0/0':
+                        existing_permissions.add(
+                            (rule['FromPort'], rule['ToPort']))
+
+        # Remove any permissions that already exist
+        filtered_permissions = []
+        for perm in ip_permissions:
+            if (perm['FromPort'], perm['ToPort']) not in existing_permissions:
+                filtered_permissions.append(perm)
+
+        if filtered_permissions:
+            sg.authorize_ingress(IpPermissions=filtered_permissions)
 
 
 def cleanup_ports(
     cluster_name_on_cloud: str,
+    ports: List[str],
     provider_config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """See sky/provision/__init__.py"""
+    del ports  # Unused.
     assert provider_config is not None, cluster_name_on_cloud
     region = provider_config['region']
     ec2 = _default_ec2_resource(region)
     sg_name = provider_config['security_group']['GroupName']
-    if sg_name == aws_cloud.DEFAULT_SECURITY_GROUP_NAME:
-        # Using default AWS SG. We only want to delete the SG that is dedicated
-        # to this cluster (i.e., this cluster have opened some ports).
+    managed_by_skypilot = provider_config['security_group'].get(
+        'ManagedBySkyPilot', True)
+    if (sg_name == aws_cloud.DEFAULT_SECURITY_GROUP_NAME or
+            not managed_by_skypilot):
+        # 1) Using default AWS SG or 2) the SG is specified by the user.
+        # We only want to delete the SG that is dedicated to this cluster (i.e.,
+        # this cluster have opened some ports).
         return
     sg = _get_sg_from_name(ec2, sg_name)
     if sg is None:
@@ -698,7 +885,8 @@ def cleanup_ports(
             sg.delete()
         except aws.botocore_exceptions().ClientError as e:
             if _DEPENDENCY_VIOLATION_PATTERN.findall(str(e)):
-                logger.info(f'Security group {sg_name} is still in use. Retry.')
+                logger.debug(
+                    f'Security group {sg_name} is still in use. Retry.')
                 time.sleep(backoff.current_backoff())
                 continue
             raise
@@ -716,9 +904,9 @@ def wait_instances(region: str, cluster_name_on_cloud: str,
     ec2 = _default_ec2_resource(region)
     client = ec2.meta.client
 
-    filters = [
+    filters: List['ec2_type_defs.FilterTypeDef'] = [
         {
-            'Name': f'tag:{TAG_RAY_CLUSTER_NAME}',
+            'Name': f'tag:{constants.TAG_RAY_CLUSTER_NAME}',
             'Values': [cluster_name_on_cloud],
         },
     ]
@@ -745,6 +933,7 @@ def wait_instances(region: str, cluster_name_on_cloud: str,
         raise RuntimeError(
             f'No instances found for cluster {cluster_name_on_cloud}.')
 
+    waiter: 'botowaiter.Waiter'
     if state == status_lib.ClusterStatus.UP:
         waiter = client.get_waiter('instance_running')
     elif state == status_lib.ClusterStatus.STOPPED:
@@ -757,17 +946,19 @@ def wait_instances(region: str, cluster_name_on_cloud: str,
     waiter.wait(WaiterConfig={'Delay': 5, 'MaxAttempts': 120}, Filters=filters)
 
 
-def get_cluster_info(region: str,
-                     cluster_name_on_cloud: str) -> common.ClusterInfo:
+def get_cluster_info(
+        region: str,
+        cluster_name_on_cloud: str,
+        provider_config: Optional[Dict[str, Any]] = None) -> common.ClusterInfo:
     """See sky/provision/__init__.py"""
     ec2 = _default_ec2_resource(region)
-    filters = [
+    filters: List['ec2_type_defs.FilterTypeDef'] = [
         {
             'Name': 'instance-state-name',
             'Values': ['running'],
         },
         {
-            'Name': f'tag:{TAG_RAY_CLUSTER_NAME}',
+            'Name': f'tag:{constants.TAG_RAY_CLUSTER_NAME}',
             'Values': [cluster_name_on_cloud],
         },
     ]
@@ -779,14 +970,18 @@ def get_cluster_info(region: str,
         tags = [(t['Key'], t['Value']) for t in inst.tags]
         # sort tags by key to support deterministic unit test stubbing
         tags.sort(key=lambda x: x[0])
-        instances[inst.id] = common.InstanceInfo(
-            instance_id=inst.id,
-            internal_ip=inst.private_ip_address,
-            external_ip=inst.public_ip_address,
-            tags=dict(tags),
-        )
+        instances[inst.id] = [
+            common.InstanceInfo(
+                instance_id=inst.id,
+                internal_ip=inst.private_ip_address,
+                external_ip=inst.public_ip_address,
+                tags=dict(tags),
+            )
+        ]
     instances = dict(sorted(instances.items(), key=lambda x: x[0]))
     return common.ClusterInfo(
         instances=instances,
         head_instance_id=head_instance_id,
+        provider_name='aws',
+        provider_config=provider_config,
     )
